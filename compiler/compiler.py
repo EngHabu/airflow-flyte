@@ -15,8 +15,47 @@ from flytekit.models import interface as interface_model, task as task_model
 from flytekit.models import literals as literals_model
 from flytekit.models.workflow_closure import WorkflowClosure
 from flytekit.sdk.types import Types
+from flytekit.models.core.identifier import Identifier as _Identifier
+from airflow import DAG, version
 
-from airflow import DAG
+
+# TODO: This function doesn't work - it needs to translate Airflow quantities into
+# strings that make sense to K8s
+def _get_flyte_resources_from_airflow_resources(airflow_resources):
+    """
+    :param airflow.utils.operator_resources.Resources airflow_resources:
+    :rtype: flyteidl.core.tasks_pb2.Resources
+    """
+    requests = []
+    requests.append(
+        task_model.Resources.ResourceEntry(
+            task_model.Resources.ResourceName.Cpu,
+            str(airflow_resources.cpus.qty)
+        )
+    )
+
+    requests.append(
+        task_model.Resources.ResourceEntry(
+            task_model.Resources.ResourceName.Memory,
+            str(airflow_resources.ram.qty)
+        )
+    )
+
+    requests.append(
+        task_model.Resources.ResourceEntry(
+            task_model.Resources.ResourceName.Gpu,
+            str(airflow_resources.gpus.qty)
+        )
+    )
+
+    requests.append(
+        task_model.Resources.ResourceEntry(
+            task_model.Resources.ResourceName.Storage,
+            str(airflow_resources.disk.qty)
+        )
+    )
+
+    return task_model.Resources(limits=[], requests=requests)
 
 
 class FlyteCompiler(object):
@@ -29,12 +68,12 @@ class FlyteCompiler(object):
     ```
     """
 
-    def _op_to_task(self, dag_id, image, op, node_map):
+    def _op_to_task(self, dag_id, image, op):
         """
         Generate task given an operator inherited from dsl.ContainerOp.
 
         :param airflow.models.BaseOperator op:
-        :param dict(Text, SdkNode) node_map:
+        # :param dict(Text, SdkNode) node_map:
         :rtype: Tuple(base_tasks.SdkTask, SdkNode)
         """
 
@@ -64,35 +103,9 @@ class FlyteCompiler(object):
         #         ''
         #     )
 
-        requests = []
+        flyte_resources = None
         if op.resources:
-            requests.append(
-                task_model.Resources.ResourceEntry(
-                    task_model.Resources.ResourceName.Cpu,
-                    op.resources.cpus
-                )
-            )
-
-            requests.append(
-                task_model.Resources.ResourceEntry(
-                    task_model.Resources.ResourceName.Memory,
-                    op.resources.ram
-                )
-            )
-
-            requests.append(
-                task_model.Resources.ResourceEntry(
-                    task_model.Resources.ResourceName.Gpu,
-                    op.resources.gpus
-                )
-            )
-
-            requests.append(
-                task_model.Resources.ResourceEntry(
-                    task_model.Resources.ResourceName.Storage,
-                    op.resources.disk
-                )
-            )
+            flyte_resources = _get_flyte_resources_from_airflow_resources(op.resources)
 
         task_instance = TaskInstance(op, datetime.datetime.now())
         command = task_instance.command_as_list(
@@ -107,14 +120,13 @@ class FlyteCompiler(object):
             cfg_path=None)
 
         task = base_tasks.SdkTask(
-            op.task_id,
             SingleStepTask,
             "airflow_op",
             task_model.TaskMetadata(
                 False,
                 task_model.RuntimeMetadata(
                     type=task_model.RuntimeMetadata.RuntimeType.Other,
-                    version=airflow.version.version,
+                    version=version.version,
                     flavor='airflow'
                 ),
                 datetime.timedelta(seconds=0),
@@ -123,32 +135,36 @@ class FlyteCompiler(object):
                 None,
             ),
             interface_common.TypedInterface(inputs=interface_inputs, outputs=interface_outputs),
-            custom=None,
+            custom={},
             container=task_model.Container(
                 image=image,
                 command=command,
                 args=[],
-                resources=task_model.Resources(limits=[], requests=requests),
+                resources=flyte_resources,
                 env={},
                 config={},
             )
+        )
+        # What happens when two operators have the same task_id?
+        # Does Airflow not allow this?
+        task._id = _Identifier(
+            2, 'airflow_example', 'development', op.task_id, 'abcde'
         )
 
         return task, task(**input_mappings).assign_id_and_return(op.task_id)
 
     def _create_tasks(self, tasks):
         """
-
         :param list[airflow.models.BaseOperator] tasks:
         :rtype: Tuple(list[flytekit.common.tasks.SdkTask], list[SdkNode])
         """
-        tasks = set()
+        flyte_tasks = set()
         nodes = {}
         for op in tasks:
-            task, node = self._op_to_task(op, nodes)
-            tasks.add(task)
+            task, node = self._op_to_task('my dag id', 'ecr.aws/lyft/etl:latest', op)
+            flyte_tasks.add(task)
             nodes[node.id] = node
-        return tasks, [v for k, v in six.iteritems(nodes)]
+        return flyte_tasks, [v for k, v in six.iteritems(nodes)]
 
     def _create_workflow(self, name, tasks):
         """
@@ -162,21 +178,10 @@ class FlyteCompiler(object):
         for t in tasks:
             deps[t] = t.upstream_task_ids
 
-        tasks, nodes = self._create_tasks(tasks)
-
-        # Create map to look up tasks by their fully-qualified name. This map goes from something like
-        # app.workflows.MyWorkflow.task_one to the task_one SdkRunnable task object
-        tmap = {}
-        for t in tasks:
-            # This mocks an Admin registration, setting the reference id to the name of the task itself
-            t.target._reference_id = t.id
-            tmap[t.id] = t
+        flyte_tasks, nodes = self._create_tasks(tasks)
 
         w = workflow_common.SdkWorkflow(inputs=[], outputs=[], nodes=nodes)
-        task_templates = []
         for n in w.nodes:
-            if n.task_node is not None:
-                task_templates.append(tmap[n.task_node.reference_id])
             # TODO: sub_dags should be converted to subwokflows
             # elif n.workflow_node is not None:
             #     n.workflow_node._launchplan_ref = n.workflow_node.id
@@ -185,7 +190,7 @@ class FlyteCompiler(object):
                 n._upstream_node_ids = deps[n.id]
 
         # Create the WorkflowClosure object that wraps both the workflow and its tasks
-        return WorkflowClosure(workflow=w, tasks=task_templates)
+        return WorkflowClosure(workflow=w, tasks=flyte_tasks)
 
     def _compile(self, dag):
         """
