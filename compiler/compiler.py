@@ -19,6 +19,45 @@ from flytekit.models.core.identifier import Identifier as _Identifier
 from airflow import DAG, version
 
 
+# TODO: This function doesn't work - it needs to translate Airflow quantities into
+# strings that make sense to K8s
+def _get_flyte_resources_from_airflow_resources(airflow_resources):
+    """
+    :param airflow.utils.operator_resources.Resources airflow_resources:
+    :rtype: flyteidl.core.tasks_pb2.Resources
+    """
+    requests = []
+    requests.append(
+        task_model.Resources.ResourceEntry(
+            task_model.Resources.ResourceName.Cpu,
+            str(airflow_resources.cpus.qty)
+        )
+    )
+
+    requests.append(
+        task_model.Resources.ResourceEntry(
+            task_model.Resources.ResourceName.Memory,
+            str(airflow_resources.ram.qty)
+        )
+    )
+
+    requests.append(
+        task_model.Resources.ResourceEntry(
+            task_model.Resources.ResourceName.Gpu,
+            str(airflow_resources.gpus.qty)
+        )
+    )
+
+    requests.append(
+        task_model.Resources.ResourceEntry(
+            task_model.Resources.ResourceName.Storage,
+            str(airflow_resources.disk.qty)
+        )
+    )
+
+    return task_model.Resources(limits=[], requests=requests)
+
+
 class FlyteCompiler(object):
     """DSL Compiler.
 
@@ -64,35 +103,9 @@ class FlyteCompiler(object):
         #         ''
         #     )
 
-        requests = []
-        # if op.resources:
-        #     requests.append(
-        #         task_model.Resources.ResourceEntry(
-        #             task_model.Resources.ResourceName.Cpu,
-        #             op.resources.cpus
-        #         )
-        #     )
-        #
-        #     requests.append(
-        #         task_model.Resources.ResourceEntry(
-        #             task_model.Resources.ResourceName.Memory,
-        #             op.resources.ram
-        #         )
-        #     )
-        #
-        #     requests.append(
-        #         task_model.Resources.ResourceEntry(
-        #             task_model.Resources.ResourceName.Gpu,
-        #             op.resources.gpus
-        #         )
-        #     )
-        #
-        #     requests.append(
-        #         task_model.Resources.ResourceEntry(
-        #             task_model.Resources.ResourceName.Storage,
-        #             op.resources.disk
-        #         )
-        #     )
+        flyte_resources = None
+        if op.resources:
+            flyte_resources = _get_flyte_resources_from_airflow_resources(op.resources)
 
         task_instance = TaskInstance(op, datetime.datetime.now())
         command = task_instance.command_as_list(
@@ -106,7 +119,6 @@ class FlyteCompiler(object):
             pickle_id=dag_id,
             cfg_path=None)
 
-        # def __init__(self, category, type, metadata, interface, custom, container=None)
         task = base_tasks.SdkTask(
             SingleStepTask,
             "airflow_op",
@@ -128,12 +140,13 @@ class FlyteCompiler(object):
                 image=image,
                 command=command,
                 args=[],
-                resources=task_model.Resources(limits=[], requests=requests),
+                resources=flyte_resources,
                 env={},
                 config={},
             )
         )
         # What happens when two operators have the same task_id?
+        # Does Airflow not allow this?
         task._id = _Identifier(
             2, 'airflow_example', 'development', op.task_id, 'abcde'
         )
@@ -166,7 +179,6 @@ class FlyteCompiler(object):
             deps[t] = t.upstream_task_ids
 
         flyte_tasks, nodes = self._create_tasks(tasks)
-        import ipdb; ipdb.set_trace()
 
         w = workflow_common.SdkWorkflow(inputs=[], outputs=[], nodes=nodes)
         for n in w.nodes:
